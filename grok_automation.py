@@ -60,6 +60,10 @@ SELECTORS = {
     # 送出按鈕：實際文字是「送出」
     "submit_btn":       'button:has-text("送出"), button[aria-label="送出"], button[aria-label="Send"], button[type="submit"]',
 
+    # ── 圖片附加 ──
+    "attach_btn":       'button:has-text("附加"), button[aria-label="附加"]',
+    "animate_menuitem": '[role="menuitem"]:has-text("動畫圖像"), menuitem:has-text("動畫圖像")',
+
     # ── 生成完成後 ──
     "video_element":    'video[src], video source[src]',
     "download_btn":     'a[download], button:has-text("下載"), button:has-text("Download"), a:has-text("下載"), a:has-text("Download")',
@@ -369,9 +373,12 @@ class GrokVideoAutomation:
     # ──────────────────────────────────────────────
     # 影片生成
     # ──────────────────────────────────────────────
-    async def generate_and_download(self, prompt: str, output_path: Path) -> bool:
+    async def generate_and_download(
+        self, prompt: str, output_path: Path, image_path: Path | None = None
+    ) -> bool:
         """
-        給定 prompt，生成影片並下載至 output_path。
+        給定 prompt（和可選圖片），生成影片並下載至 output_path。
+        image_path：若提供，使用「動畫圖像」模式上傳圖片後生成影片。
         成功回傳 True，失敗回傳 False。
         """
         # 1. 確認在 imagine 頁面
@@ -380,8 +387,13 @@ class GrokVideoAutomation:
         await self._page.wait_for_timeout(3000)  # 等頁面及歷史影片請求穩定
         await self._close_modal()   # 關閉可能再次出現的彈窗
 
-        # 2. 切換到影片模式
-        await self._switch_to_video_mode()
+        if image_path:
+            # 2a. 圖片模式：附加圖片（會自動切換至影片模式）
+            if not await self._attach_image(image_path):
+                return False
+        else:
+            # 2b. 純文字模式：手動切換至影片模式
+            await self._switch_to_video_mode()
 
         # 3. 輸入 prompt
         if not await self._fill_prompt(prompt):
@@ -404,6 +416,43 @@ class GrokVideoAutomation:
 
         # 6. 下載影片
         return await self._download_video(video_url, output_path)
+
+    async def _attach_image(self, image_path: Path) -> bool:
+        """
+        點擊「附加」→「動畫圖像」，上傳圖片至 prompt 輸入區。
+        選擇「動畫圖像」會自動切換成影片模式，無需再手動切換。
+        成功回傳 True，失敗回傳 False。
+        """
+        try:
+            # 點擊「附加」按鈕展開選單
+            attach_btn = await self._page.wait_for_selector(
+                SELECTORS["attach_btn"], timeout=TIMEOUTS["short"], state="visible"
+            )
+            await attach_btn.click()
+            logger.info("已點擊「附加」按鈕")
+            await self._page.wait_for_timeout(500)
+
+            # 點擊「動畫圖像」選單項，同時攔截 File Chooser
+            async with self._page.expect_file_chooser(timeout=8000) as fc_info:
+                animate_item = await self._page.wait_for_selector(
+                    SELECTORS["animate_menuitem"], timeout=5000, state="visible"
+                )
+                await animate_item.click()
+
+            file_chooser = await fc_info.value
+            await file_chooser.set_files(str(image_path))
+            logger.info("已上傳圖片：%s", image_path.name)
+
+            # 等待圖片縮圖出現在輸入區（表示上傳完成）
+            await self._page.wait_for_timeout(1500)
+            return True
+
+        except PlaywrightTimeoutError as e:
+            logger.error("附加圖片失敗（timeout）：%s", e)
+            return False
+        except Exception as e:
+            logger.error("附加圖片時發生錯誤：%s", e)
+            return False
 
     async def _switch_to_video_mode(self):
         """切換至影片生成模式（點擊 radiogroup 中的「影片」radio）"""

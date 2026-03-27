@@ -50,6 +50,18 @@ def collect_prompts() -> list[Path]:
     return files
 
 
+def find_image(prompt_file: Path) -> Path | None:
+    """
+    尋找與 prompt 檔案同名的圖片（.png 優先，其次 .jpg / .jpeg）。
+    例：scene01.txt → scene01.png 或 scene01.jpg
+    """
+    for ext in (".png", ".jpg", ".jpeg"):
+        img = prompt_file.with_suffix(ext)
+        if img.exists():
+            return img
+    return None
+
+
 def read_prompt(path: Path) -> str:
     """讀取 prompt 檔案內容並去除前後空白"""
     return path.read_text(encoding="utf-8").strip()
@@ -138,20 +150,31 @@ async def run():
                 move_to_done(prompt_file)
                 continue
 
+            # 尋找同名圖片（.png / .jpg / .jpeg）
+            image_path = find_image(prompt_file)
+
             logger.info("=" * 60)
             logger.info("[%d/%d] 處理：%s", idx, len(prompt_files), prompt_file.name)
             logger.info("Prompt：%s", prompt_text[:120])
+            if image_path:
+                logger.info("附加圖片：%s", image_path.name)
+            else:
+                logger.info("模式：純文字")
 
             output_path = build_output_path(prompt_file)
 
             ok = await bot.generate_and_download(
                 prompt=prompt_text,
                 output_path=output_path,
+                image_path=image_path,
             )
 
             if ok:
                 logger.info("成功：影片已儲存至 %s", output_path)
                 move_to_done(prompt_file)
+                # 圖片與 txt 一起移至 done
+                if image_path:
+                    move_to_done(image_path)
                 success_count += 1
             else:
                 logger.error("失敗：%s 未能生成影片，檔案保留在 prompts/", prompt_file.name)

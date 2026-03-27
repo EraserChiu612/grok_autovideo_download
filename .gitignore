@@ -28,3 +28,8 @@ env/
 # 系統檔
 .DS_Store
 Thumbs.db
+
+# Prompt 配對圖片（含個人內容）
+prompts/*.png
+prompts/*.jpg
+prompts/*.jpeg
