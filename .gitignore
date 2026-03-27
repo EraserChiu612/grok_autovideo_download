@@ -1,0 +1,30 @@
+# 隱私與憑證
+.env
+
+# 瀏覽器 session（含 Cookie / Token）
+session/
+
+# 生成的影片輸出
+output/
+
+# 執行日誌
+run.log
+
+# Prompt 檔案（含個人內容）
+prompts/*.txt
+prompts/done/
+
+# Python 快取
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# 虛擬環境
+venv/
+.venv/
+env/
+
+# 系統檔
+.DS_Store
+Thumbs.db
