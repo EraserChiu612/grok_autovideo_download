@@ -1,16 +1,16 @@
 """
 main.py
-入口程式：掃描 ./prompts/ 中的 .txt 檔，逐一送至 grok.com/imagine 生成影片，
-下載至 ./output/，完成後將 prompt 檔移至 ./prompts/done/
+入口程式：讀取 ./prompts/prompts_use.xlsx，逐一送至 grok.com/imagine 生成影片，
+下載至 ./output/<日期>/，完成整列後在 D 欄寫入 Y。
 """
 import asyncio
 import logging
 import os
-import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
 
+import openpyxl
 from dotenv import load_dotenv
 
 from grok_automation import GrokVideoAutomation
@@ -20,7 +20,7 @@ from grok_automation import GrokVideoAutomation
 # ──────────────────────────────────────────────
 BASE_DIR    = Path(__file__).parent
 PROMPTS_DIR = BASE_DIR / "prompts"
-DONE_DIR    = PROMPTS_DIR / "done"
+XLSX_PATH   = PROMPTS_DIR / "prompts_use.xlsx"
 OUTPUT_DIR  = BASE_DIR / "output"
 
 
@@ -40,59 +40,82 @@ def setup_logging():
 
 
 # ──────────────────────────────────────────────
-# Prompt 掃描
+# Excel 讀取
 # ──────────────────────────────────────────────
-def collect_prompts() -> list[Path]:
-    """回傳 prompts/ 下所有 .txt 檔（排除 done/ 子目錄），依名稱排序"""
-    files = sorted(PROMPTS_DIR.glob("*.txt"))
-    if not files:
-        logging.warning("在 %s 中找不到任何 .txt 檔案", PROMPTS_DIR)
-    return files
-
-
-def find_image(prompt_file: Path) -> Path | None:
+def collect_excel_rows(xlsx_path: Path) -> list[dict]:
     """
-    尋找與 prompt 檔案同名的圖片（.png 優先，其次 .jpg / .jpeg）。
-    例：scene01.txt → scene01.png 或 scene01.jpg
+    讀取 xlsx，回傳所有待處理的「列」資訊。
+    每個 dict：
+        sheet_name : 工作表名稱
+        row_idx    : 列號（xlsx 的實際列號，從 2 開始）
+        prompts    : [(seq, prompt_text), ...]  本列要依序處理的 prompt
+    跳過 D 欄已有 Y 的列；跳過 B、C 都空的列。
+    seq（流水號）在同一工作表內連續遞增，已完成的列也計入。
     """
-    for ext in (".png", ".jpg", ".jpeg"):
-        img = prompt_file.with_suffix(ext)
-        if img.exists():
-            return img
-    return None
+    wb = openpyxl.load_workbook(xlsx_path)
+    rows_to_process = []
+
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        seq = 0  # 每張工作表獨立計算
+
+        for row_idx in range(2, ws.max_row + 1):
+            b_val = ws.cell(row=row_idx, column=2).value
+            c_val = ws.cell(row=row_idx, column=3).value
+            d_val = ws.cell(row=row_idx, column=4).value
+
+            b_text = str(b_val).strip() if b_val else ""
+            c_text = str(c_val).strip() if c_val else ""
+
+            # 計算本列的序號（不管是否已完成都要累計）
+            row_prompts = []
+            if b_text:
+                seq += 1
+                row_prompts.append((seq, b_text))
+            if c_text:
+                seq += 1
+                row_prompts.append((seq, c_text))
+
+            # 無內容 → 跳過
+            if not row_prompts:
+                continue
+
+            # 已完成 → 計入 seq 但不加入待處理清單
+            if d_val and str(d_val).strip().upper() == "Y":
+                continue
+
+            rows_to_process.append({
+                "sheet_name": sheet_name,
+                "row_idx":    row_idx,
+                "prompts":    row_prompts,
+            })
+
+    return rows_to_process
 
 
-def read_prompt(path: Path) -> str:
-    """讀取 prompt 檔案內容並去除前後空白"""
-    return path.read_text(encoding="utf-8").strip()
-
-
-def move_to_done(path: Path):
-    """將已處理的 prompt 檔案移至 done/ 資料夾"""
-    DONE_DIR.mkdir(parents=True, exist_ok=True)
-    dest = DONE_DIR / path.name
-    # 若 done/ 內已有同名檔，加上時間戳避免覆蓋
-    if dest.exists():
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        dest = DONE_DIR / f"{path.stem}_{ts}{path.suffix}"
-    shutil.move(str(path), str(dest))
-    logging.info("已移至 done：%s", dest)
+def mark_row_done(xlsx_path: Path, sheet_name: str, row_idx: int):
+    """在指定工作表、列的 D 欄寫入 Y 並存檔"""
+    wb = openpyxl.load_workbook(xlsx_path)
+    ws = wb[sheet_name]
+    ws.cell(row=row_idx, column=4).value = "Y"
+    wb.save(xlsx_path)
+    logging.getLogger(__name__).info(
+        "已在 %s Row%d 標記完成（D 欄寫入 Y）", sheet_name, row_idx
+    )
 
 
 # ──────────────────────────────────────────────
 # 輸出檔名
 # ──────────────────────────────────────────────
-def build_output_path(prompt_file: Path) -> Path:
+def build_output_path(sheet_name: str, seq: int) -> Path:
     """
-    output 檔名 = output/<日期>/<prompt 檔名>_<時間戳>.mp4
-    例：output/20260330/my_scene_20260330_153045.mp4
+    output 檔名 = output/<日期>/<工作表名稱>_<流水號>_<日期>.mp4
+    例：output/20260402/cute_pets_01_20260402.mp4
     """
-    now = datetime.now()
-    date_str = now.strftime("%Y%m%d")
-    ts = now.strftime("%Y%m%d_%H%M%S")
+    date_str = datetime.now().strftime("%Y%m%d")
     date_dir = OUTPUT_DIR / date_str
     date_dir.mkdir(parents=True, exist_ok=True)
-    return date_dir / f"{prompt_file.stem}_{ts}.mp4"
+    return date_dir / f"{sheet_name}_{seq:02d}_{date_str}.mp4"
 
 
 # ──────────────────────────────────────────────
@@ -119,18 +142,26 @@ async def run():
 
     logger.info("登入方式：%s", login_method)
 
-    # 建立必要資料夾
-    PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
-    DONE_DIR.mkdir(parents=True, exist_ok=True)
+    # 確認 xlsx 存在
+    if not XLSX_PATH.exists():
+        logger.error("找不到 %s，請確認檔案路徑", XLSX_PATH)
+        sys.exit(1)
+
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # 掃描 prompt 檔案
-    prompt_files = collect_prompts()
-    if not prompt_files:
-        logger.info("沒有待處理的 prompt，程式結束")
+    # 讀取待處理列
+    pending_rows = collect_excel_rows(XLSX_PATH)
+    if not pending_rows:
+        logger.info("xlsx 中沒有待處理的 prompt，程式結束")
         return
 
-    logger.info("共找到 %d 個 prompt 檔案，開始處理…", len(prompt_files))
+    total_prompts = sum(len(r["prompts"]) for r in pending_rows)
+    logger.info(
+        "共 %d 張工作表，%d 列待處理，%d 個 prompt，開始處理…",
+        len({r["sheet_name"] for r in pending_rows}),
+        len(pending_rows),
+        total_prompts,
+    )
 
     # 啟動自動化
     bot = GrokVideoAutomation(
@@ -140,9 +171,13 @@ async def run():
         handle=handle,
         login_method=login_method,
     )
-    await bot.start(headless=False)   # headless=True 可隱藏視窗，建議先用 False 確認流程
+    await bot.start(headless=False)
 
     error_occurred = False
+    success_count  = 0
+    fail_count     = 0
+    global_idx     = 0  # 跨所有 prompt 的進度計數
+
     try:
         # 登入（只需一次）
         if not await bot.ensure_logged_in():
@@ -150,52 +185,53 @@ async def run():
             error_occurred = True
             return
 
-        # 逐一處理
-        success_count = 0
-        fail_count    = 0
+        for row in pending_rows:
+            sheet_name = row["sheet_name"]
+            row_idx    = row["row_idx"]
+            prompts    = row["prompts"]   # [(seq, text), ...]
 
-        for idx, prompt_file in enumerate(prompt_files, 1):
-            prompt_text = read_prompt(prompt_file)
-            if not prompt_text:
-                logger.warning("[%d/%d] %s 內容為空，跳過",
-                               idx, len(prompt_files), prompt_file.name)
-                move_to_done(prompt_file)
-                continue
+            row_all_ok = True
 
-            # 尋找同名圖片（.png / .jpg / .jpeg）
-            image_path = find_image(prompt_file)
+            for seq, prompt_text in prompts:
+                global_idx += 1
+                output_path = build_output_path(sheet_name, seq)
 
-            logger.info("=" * 60)
-            logger.info("[%d/%d] 處理：%s", idx, len(prompt_files), prompt_file.name)
-            logger.info("Prompt：%s", prompt_text[:120])
-            if image_path:
-                logger.info("附加圖片：%s", image_path.name)
+                logger.info("=" * 60)
+                logger.info(
+                    "[%d/%d] 工作表：%s  Row%d  seq=%02d",
+                    global_idx, total_prompts, sheet_name, row_idx, seq,
+                )
+                logger.info("Prompt：%s", prompt_text[:120])
+
+                ok = await bot.generate_and_download(
+                    prompt=prompt_text,
+                    output_path=output_path,
+                )
+
+                if ok:
+                    logger.info("成功：影片已儲存至 %s", output_path)
+                    success_count += 1
+                else:
+                    logger.error(
+                        "失敗：工作表 %s Row%d seq=%02d 未能生成影片",
+                        sheet_name, row_idx, seq,
+                    )
+                    fail_count  += 1
+                    row_all_ok   = False
+
+                # 每個 prompt 之間稍作間隔
+                if global_idx < total_prompts:
+                    logger.info("等待 5 秒後處理下一個…")
+                    await asyncio.sleep(5)
+
+            # 整列所有 prompt 都成功 → 標記 Y
+            if row_all_ok:
+                mark_row_done(XLSX_PATH, sheet_name, row_idx)
             else:
-                logger.info("模式：純文字")
-
-            output_path = build_output_path(prompt_file)
-
-            ok = await bot.generate_and_download(
-                prompt=prompt_text,
-                output_path=output_path,
-                image_path=image_path,
-            )
-
-            if ok:
-                logger.info("成功：影片已儲存至 %s", output_path)
-                move_to_done(prompt_file)
-                # 圖片與 txt 一起移至 done
-                if image_path:
-                    move_to_done(image_path)
-                success_count += 1
-            else:
-                logger.error("失敗：%s 未能生成影片，檔案保留在 prompts/", prompt_file.name)
-                fail_count += 1
-
-            # 每個任務之間稍作間隔，避免請求過於頻繁
-            if idx < len(prompt_files):
-                logger.info("等待 5 秒後處理下一個…")
-                await asyncio.sleep(5)
+                logger.warning(
+                    "工作表 %s Row%d 有 prompt 失敗，不標記 Y，可重新執行補跑",
+                    sheet_name, row_idx,
+                )
 
     except Exception as e:
         logger.error("發生未預期錯誤：%s", e, exc_info=True)
@@ -203,7 +239,6 @@ async def run():
 
     finally:
         if error_occurred:
-            # 發生錯誤時保持瀏覽器開啟，讓使用者能夠手動檢查
             logger.warning("=" * 60)
             logger.warning("發生錯誤，瀏覽器保持開啟以供檢查。")
             logger.warning("確認完畢後，請在此按 Enter 關閉瀏覽器…")
@@ -214,7 +249,7 @@ async def run():
     logger.info("=" * 60)
     logger.info("全部完成：成功 %d 支 / 失敗 %d 支", success_count, fail_count)
     if fail_count > 0:
-        logger.info("失敗的 prompt 檔案仍留在 ./prompts/，修正後可重新執行")
+        logger.info("失敗的列未標記 Y，修正後可重新執行補跑")
 
 
 if __name__ == "__main__":
