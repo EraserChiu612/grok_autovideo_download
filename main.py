@@ -84,11 +84,15 @@ def move_to_done(path: Path):
 # ──────────────────────────────────────────────
 def build_output_path(prompt_file: Path) -> Path:
     """
-    output 檔名 = prompt 檔名（無副檔名）+ 時間戳 + .mp4
-    例：my_scene_20240101_153045.mp4
+    output 檔名 = output/<日期>/<prompt 檔名>_<時間戳>.mp4
+    例：output/20260330/my_scene_20260330_153045.mp4
     """
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return OUTPUT_DIR / f"{prompt_file.stem}_{ts}.mp4"
+    now = datetime.now()
+    date_str = now.strftime("%Y%m%d")
+    ts = now.strftime("%Y%m%d_%H%M%S")
+    date_dir = OUTPUT_DIR / date_str
+    date_dir.mkdir(parents=True, exist_ok=True)
+    return date_dir / f"{prompt_file.stem}_{ts}.mp4"
 
 
 # ──────────────────────────────────────────────
@@ -100,13 +104,20 @@ async def run():
 
     # 載入 .env
     load_dotenv()
-    username = os.getenv("X_USERNAME", "").strip()
-    password = os.getenv("X_PASSWORD", "").strip()
-    handle   = os.getenv("X_HANDLE", "").strip()
+    username     = os.getenv("X_USERNAME", "").strip()
+    password     = os.getenv("X_PASSWORD", "").strip()
+    handle       = os.getenv("X_HANDLE", "").strip()
+    login_method = os.getenv("LOGIN_METHOD", "x").strip().lower()
 
     if not username or not password:
         logger.error("請在 .env 中設定 X_USERNAME 與 X_PASSWORD")
         sys.exit(1)
+
+    if login_method not in ("x", "email"):
+        logger.warning("LOGIN_METHOD 值無效（%s），將使用預設值 'x'", login_method)
+        login_method = "x"
+
+    logger.info("登入方式：%s", login_method)
 
     # 建立必要資料夾
     PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -127,6 +138,7 @@ async def run():
         password=password,
         output_dir=OUTPUT_DIR,
         handle=handle,
+        login_method=login_method,
     )
     await bot.start(headless=False)   # headless=True 可隱藏視窗，建議先用 False 確認流程
 

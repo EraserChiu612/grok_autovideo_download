@@ -80,11 +80,21 @@ TIMEOUTS = {
 
 
 class GrokVideoAutomation:
-    def __init__(self, username: str, password: str, output_dir: Path, handle: str = ""):
+    def __init__(
+        self,
+        username: str,
+        password: str,
+        output_dir: Path,
+        handle: str = "",
+        login_method: str = "x",
+    ):
         self.username = username
         self.password = password
         self.handle = handle      # X 使用者名稱（@後面的部分），用於異常登入驗證
         self.output_dir = output_dir
+        # login_method: "x"     → 透過 x.com 登入（原流程）
+        #               "email" → 直接在 accounts.x.ai 用 email 登入（不跳轉 x.com）
+        self.login_method = login_method.strip().lower()
         self._playwright = None
         self._browser: Browser = None
         self._context: BrowserContext = None
@@ -164,8 +174,10 @@ class GrokVideoAutomation:
             logger.info("Session 有效，已登入")
             return True
 
-        logger.info("偵測到未登入，開始登入流程…")
-        return await self._login()
+        logger.info("偵測到未登入，開始登入流程（方式：%s）…", self.login_method)
+        if self.login_method == "email":
+            return await self._login_via_email()
+        return await self._login_via_x()
 
     async def _handle_unusual_activity_check(self):
         """
@@ -245,29 +257,69 @@ class GrokVideoAutomation:
         logger.info("未偵測到 Sign In 按鈕 → 已登入")
         return True
 
-    async def _login(self) -> bool:
+    async def _go_to_accounts_xai(self) -> bool:
         """
-        執行登入流程（三段跳轉）：
-        grok.com → accounts.x.ai → x.com → grok.com
-        注意：navigation 監聽必須在 click 之前設定，否則會錯過事件。
+        共用步驟：從 grok.com 點擊登入按鈕，跳轉至 accounts.x.ai。
+        成功回傳 True，失敗回傳 False。
+        """
+        sign_in = await self._page.wait_for_selector(
+            SELECTORS["sign_in_btn"], timeout=TIMEOUTS["short"], state="visible"
+        )
+        async with self._page.expect_navigation(wait_until="domcontentloaded", timeout=15_000):
+            await sign_in.click()
+            logger.info("已點擊登入，等待跳轉至 accounts.x.ai…")
+
+        await self._page.wait_for_load_state("domcontentloaded")
+        logger.info("已到達：%s", self._page.url)
+
+        if "x.ai" not in self._page.url:
+            logger.error("預期跳轉至 accounts.x.ai，實際 URL：%s", self._page.url)
+            return False
+        await self._page.wait_for_timeout(1000)
+        return True
+
+    async def _save_session_and_verify(self) -> bool:
+        """
+        共用步驟：（若尚未到 grok.com）等待導回、儲存 session、確認已登入。
+        """
+        # OAuth 授權頁（如有）
+        await self._handle_oauth_authorize()
+
+        # 若還不在 grok.com，再等一次
+        if "grok.com" not in self._page.url:
+            try:
+                await self._page.wait_for_url(
+                    "*grok.com*", timeout=30_000, wait_until="domcontentloaded"
+                )
+            except PlaywrightTimeoutError:
+                if "grok.com" in self._page.url:
+                    logger.info("已快速跳轉至 grok.com（%s），繼續流程", self._page.url)
+                else:
+                    logger.error("等待 grok.com 超時，目前頁面：%s", self._page.url)
+                    return False
+
+        logger.info("已在 grok.com，等待頁面穩定…")
+        await self._page.wait_for_timeout(3000)
+        await self._close_modal()
+
+        if not await self._is_logged_in():
+            logger.error("登入後仍偵測到 Sign In 按鈕，請確認帳密是否正確")
+            return False
+
+        Path(SESSION_FILE).parent.mkdir(parents=True, exist_ok=True)
+        await self._context.storage_state(path=SESSION_FILE)
+        logger.info("登入成功，session 已儲存至 %s", SESSION_FILE)
+        return True
+
+    async def _login_via_x(self) -> bool:
+        """
+        登入流程 A（原流程，三段跳轉）：
+        grok.com → accounts.x.ai → 點「使用 X 登录」→ x.com → grok.com
         """
         try:
-            # ── 第 1 段：grok.com 點登入 → accounts.x.ai ──
-            sign_in = await self._page.wait_for_selector(
-                SELECTORS["sign_in_btn"], timeout=TIMEOUTS["short"], state="visible"
-            )
-            # 在點擊前設定 navigation 等待，避免錯過事件
-            async with self._page.expect_navigation(wait_until="domcontentloaded", timeout=15_000):
-                await sign_in.click()
-                logger.info("已點擊登入，等待跳轉至 accounts.x.ai…")
-
-            await self._page.wait_for_load_state("domcontentloaded")
-            logger.info("已到達：%s", self._page.url)
-
-            if "x.ai" not in self._page.url:
-                logger.error("預期跳轉至 accounts.x.ai，實際 URL：%s", self._page.url)
+            # ── 第 1 段：grok.com → accounts.x.ai ──
+            if not await self._go_to_accounts_xai():
                 return False
-            await self._page.wait_for_timeout(1000)
 
             # ── 第 2 段：accounts.x.ai 點「使用 X 登录」→ x.com ──
             x_btn = await self._page.wait_for_selector(
@@ -293,7 +345,6 @@ class GrokVideoAutomation:
             await self._page.fill(SELECTORS["x_username_input"], self.username)
             logger.info("已輸入帳號")
 
-            # Next 按鈕
             try:
                 next_btn = await self._page.wait_for_selector(
                     SELECTORS["x_next_btn"], timeout=5000, state="visible"
@@ -304,17 +355,14 @@ class GrokVideoAutomation:
             logger.info("已點擊 Next")
             await self._page.wait_for_timeout(1500)
 
-            # ── 異常登入驗證：X 可能要求輸入電話或使用者名稱 ──
             await self._handle_unusual_activity_check()
 
-            # 輸入密碼
             await self._page.wait_for_selector(
                 SELECTORS["x_password_input"], timeout=TIMEOUTS["login"], state="visible"
             )
             await self._page.fill(SELECTORS["x_password_input"], self.password)
             logger.info("已輸入密碼")
 
-            # Log in 按鈕
             try:
                 login_btn = await self._page.wait_for_selector(
                     SELECTORS["x_login_btn"], timeout=5000, state="visible"
@@ -327,47 +375,111 @@ class GrokVideoAutomation:
                 await self._page.wait_for_load_state("domcontentloaded", timeout=30_000)
 
             logger.info("登入後頁面 URL：%s", self._page.url)
-
-            # ── OAuth 授權頁：點擊「授權應用程式」──
-            await self._handle_oauth_authorize()
-
-            # 若還在 x.com / accounts.x.ai（可能有授權確認頁），再等一次導回
-            if "grok.com" not in self._page.url:
-                try:
-                    await self._page.wait_for_url(
-                        "*grok.com*", timeout=30_000, wait_until="domcontentloaded"
-                    )
-                except PlaywrightTimeoutError:
-                    # 授權後可能快速跳轉，事件在 wait_for_url 設定前已觸發
-                    # 只要當前 URL 已在 grok.com 即可繼續
-                    if "grok.com" in self._page.url:
-                        logger.info("已快速跳轉至 grok.com（%s），繼續流程", self._page.url)
-                    else:
-                        logger.error("等待 grok.com 超時，目前頁面：%s", self._page.url)
-                        return False
-
-            logger.info("已導回 grok.com，等待頁面穩定…")
-            await self._page.wait_for_timeout(3000)
-
-            # 關閉可能再次出現的歡迎彈窗
-            await self._close_modal()
-
-            if not await self._is_logged_in():
-                logger.error("登入後仍偵測到 Sign In 按鈕，請確認帳密是否正確")
-                return False
-
-            # 儲存 session
-            Path(SESSION_FILE).parent.mkdir(parents=True, exist_ok=True)
-            await self._context.storage_state(path=SESSION_FILE)
-            logger.info("登入成功，session 已儲存至 %s", SESSION_FILE)
-            return True
+            return await self._save_session_and_verify()
 
         except PlaywrightTimeoutError as e:
-            logger.error("登入流程超時：%s", e)
+            logger.error("登入流程超時（方式 X）：%s", e)
             logger.error("目前頁面 URL：%s", self._page.url)
             return False
         except Exception as e:
-            logger.error("登入時發生未預期錯誤：%s", e)
+            logger.error("登入時發生未預期錯誤（方式 X）：%s", e)
+            return False
+
+    async def _login_via_email(self) -> bool:
+        """
+        登入流程 B（直接 email 登入，不跳轉 x.com）：
+        grok.com → accounts.x.ai → 點「使用邮箱登录」→ 填 email → 填密碼 → grok.com
+        整個過程保持在 accounts.x.ai，不跳轉至 x.com。
+        """
+        try:
+            # ── 第 1 段：grok.com → accounts.x.ai ──
+            if not await self._go_to_accounts_xai():
+                return False
+
+            # ── 第 2 段：點「使用邮箱登录」按鈕 ──
+            email_login_btn = await self._page.wait_for_selector(
+                'button:has-text("使用邮箱登录"), button:has-text("使用電子郵件登入"), '
+                'button:has-text("Sign in with email"), button:has-text("Continue with email")',
+                timeout=10_000, state="visible"
+            )
+            await email_login_btn.click()
+            logger.info("已點擊「使用邮箱登录」")
+            await self._page.wait_for_timeout(2000)
+            logger.info("目前頁面 URL：%s", self._page.url)
+
+            # ── 第 3 段：填入 email（用 type() 觸發 React onChange）──
+            email_input = await self._page.wait_for_selector(
+                'input[data-testid="email"], input[name="email"], input[type="email"]',
+                timeout=TIMEOUTS["login"], state="visible"
+            )
+            await email_input.click()
+            await email_input.type(self.username, delay=50)
+            logger.info("已輸入 email：%s", self.username)
+
+            # 下一步
+            try:
+                next_btn = await self._page.wait_for_selector(
+                    'button:has-text("下一步"), button:has-text("Next"), button:has-text("Continue")',
+                    timeout=5000, state="visible"
+                )
+                await next_btn.click()
+            except PlaywrightTimeoutError:
+                await self._page.keyboard.press("Enter")
+            logger.info("已點擊「下一步」")
+
+            # 等待密碼頁面（含 Turnstile）完整載入
+            await self._page.wait_for_timeout(5000)
+
+            # ── 第 4 段：填入密碼（用 type() 觸發 React onChange）──
+            password_input = await self._page.wait_for_selector(
+                'input[type="password"], input[name="password"]',
+                timeout=TIMEOUTS["login"], state="visible"
+            )
+            await password_input.click()
+            await password_input.type(self.password, delay=50)
+            logger.info("已輸入密碼")
+
+            # 給 Turnstile 額外時間完成驗證
+            await self._page.wait_for_timeout(4000)
+
+            # 登入按鈕：使用 type="submit" + class 包含 w-full 精確定位
+            try:
+                login_btn = await self._page.wait_for_selector(
+                    'button[type="submit"].w-full, '
+                    'button[type="submit"]:has-text("登录"), '
+                    'button[type="submit"]:has-text("Log in")',
+                    timeout=5000, state="visible"
+                )
+                await login_btn.click()
+                logger.info("已點擊登入按鈕（email 方式）")
+            except PlaywrightTimeoutError:
+                await self._page.keyboard.press("Enter")
+                logger.info("找不到登入按鈕，改用 Enter 送出")
+
+            # 等待 accounts.x.ai 自動完成認證並重定向（最多等 40 秒，每 2 秒確認一次）
+            logger.info("等待 accounts.x.ai 完成認證並重定向…")
+            deadline_sec = 40
+            for _ in range(deadline_sec // 2):
+                await self._page.wait_for_timeout(2000)
+                if "grok.com" in self._page.url:
+                    logger.info("已重定向至 grok.com：%s", self._page.url)
+                    break
+                current = self._page.url
+                if "accounts.x.ai" not in current:
+                    logger.info("URL 已變更至：%s", current)
+                    break
+            else:
+                logger.info("40 秒內未自動重定向，目前 URL：%s", self._page.url)
+
+            logger.info("目前 URL：%s", self._page.url)
+            return await self._save_session_and_verify()
+
+        except PlaywrightTimeoutError as e:
+            logger.error("登入流程超時（方式 email）：%s", e)
+            logger.error("目前頁面 URL：%s", self._page.url)
+            return False
+        except Exception as e:
+            logger.error("登入時發生未預期錯誤（方式 email）：%s", e)
             return False
 
     # ──────────────────────────────────────────────
@@ -443,8 +555,12 @@ class GrokVideoAutomation:
             await file_chooser.set_files(str(image_path))
             logger.info("已上傳圖片：%s", image_path.name)
 
-            # 等待圖片縮圖出現在輸入區（表示上傳完成）
-            await self._page.wait_for_timeout(1500)
+            # 等待「Remove image」按鈕出現，確認圖片縮圖已顯示、UI 已穩定
+            await self._page.wait_for_selector(
+                'button[aria-label="Remove image"], button:has-text("Remove image")',
+                timeout=15_000, state="visible"
+            )
+            logger.info("圖片已顯示於輸入區，UI 就緒")
             return True
 
         except PlaywrightTimeoutError as e:
@@ -485,11 +601,10 @@ class GrokVideoAutomation:
         """找到輸入框並填入 prompt"""
         try:
             input_el = await self._page.wait_for_selector(
-                SELECTORS["prompt_input"], timeout=TIMEOUTS["short"], state="visible"
+                SELECTORS["prompt_input"], timeout=15_000, state="visible"
             )
             await input_el.click()
-            await input_el.fill("")          # 清空舊內容
-            await input_el.type(prompt, delay=30)  # 逐字輸入，模擬人工操作
+            await input_el.fill(prompt)      # 一次性填入，不受長度限制
             logger.info("已填入 prompt（%d 字元）", len(prompt))
             return True
         except PlaywrightTimeoutError:
