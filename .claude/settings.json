@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python main.py)",
+      "Bash(python inspect_login_page.py)"
+    ],
+    "additionalDirectories": [
+      "c:\\Users\\User\\Documents\\claude_code_2\\grok_auto_video_project\\session"
+    ]
+  }
+}

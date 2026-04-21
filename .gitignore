@@ -33,3 +33,12 @@ Thumbs.db
 prompts/*.png
 prompts/*.jpg
 prompts/*.jpeg
+
+# Prompt 資料（含個人內容）
+prompts/*.xlsx
+prompts/*.xls
+
+# 除錯暫存檔
+debug_page_state.png
+diagnose_output.txt
+diagnose_settings.py

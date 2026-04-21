@@ -1,17 +1,19 @@
 """
 main.py
 入口程式：讀取 ./prompts/prompts_use.xlsx，逐一送至 grok.com/imagine 生成影片，
-下載至 ./output/<日期>/，完成整列後在 D 欄寫入 Y。
+下載至 ./output/<日期>/，完成整列後在 F 欄寫入 Y。
 """
 import asyncio
 import logging
 import os
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
 import openpyxl
 from dotenv import load_dotenv
+from mutagen.mp4 import MP4, MP4Cover
 
 from grok_automation import GrokVideoAutomation
 
@@ -49,7 +51,9 @@ def collect_excel_rows(xlsx_path: Path) -> list[dict]:
         sheet_name : 工作表名稱
         row_idx    : 列號（xlsx 的實際列號，從 2 開始）
         prompts    : [(seq, prompt_text), ...]  本列要依序處理的 prompt
-    跳過 D 欄已有 Y 的列；跳過 B、C 都空的列。
+        title      : D 欄內容（主題），可為空字串
+        notes      : E 欄內容（註記），可為空字串
+    跳過 F 欄已有 Y 的列；跳過 B、C 都空的列。
     seq（流水號）在同一工作表內連續遞增，已完成的列也計入。
     """
     wb = openpyxl.load_workbook(xlsx_path)
@@ -62,7 +66,9 @@ def collect_excel_rows(xlsx_path: Path) -> list[dict]:
         for row_idx in range(2, ws.max_row + 1):
             b_val = ws.cell(row=row_idx, column=2).value
             c_val = ws.cell(row=row_idx, column=3).value
-            d_val = ws.cell(row=row_idx, column=4).value
+            d_val = ws.cell(row=row_idx, column=4).value  # 主題
+            e_val = ws.cell(row=row_idx, column=5).value  # 註記
+            f_val = ws.cell(row=row_idx, column=6).value  # 完成標記
 
             b_text = str(b_val).strip() if b_val else ""
             c_text = str(c_val).strip() if c_val else ""
@@ -81,27 +87,47 @@ def collect_excel_rows(xlsx_path: Path) -> list[dict]:
                 continue
 
             # 已完成 → 計入 seq 但不加入待處理清單
-            if d_val and str(d_val).strip().upper() == "Y":
+            if f_val and str(f_val).strip().upper() == "Y":
                 continue
 
             rows_to_process.append({
                 "sheet_name": sheet_name,
                 "row_idx":    row_idx,
                 "prompts":    row_prompts,
+                "title":      str(d_val).strip() if d_val else "",
+                "notes":      str(e_val).strip() if e_val else "",
             })
 
     return rows_to_process
 
 
-def mark_row_done(xlsx_path: Path, sheet_name: str, row_idx: int):
-    """在指定工作表、列的 D 欄寫入 Y 並存檔"""
-    wb = openpyxl.load_workbook(xlsx_path)
-    ws = wb[sheet_name]
-    ws.cell(row=row_idx, column=4).value = "Y"
-    wb.save(xlsx_path)
-    logging.getLogger(__name__).info(
-        "已在 %s Row%d 標記完成（D 欄寫入 Y）", sheet_name, row_idx
-    )
+def mark_row_done(xlsx_path: Path, sheet_name: str, row_idx: int, retries: int = 5, delay: float = 5.0):
+    """
+    在指定工作表、列的 F 欄寫入 Y 並存檔。
+    若檔案被 Excel 鎖住（PermissionError），每隔 delay 秒重試，最多 retries 次。
+    """
+    logger = logging.getLogger(__name__)
+    for attempt in range(1, retries + 1):
+        try:
+            wb = openpyxl.load_workbook(xlsx_path)
+            ws = wb[sheet_name]
+            ws.cell(row=row_idx, column=6).value = "Y"
+            wb.save(xlsx_path)
+            logger.info("已在 %s Row%d 標記完成（F 欄寫入 Y）", sheet_name, row_idx)
+            return
+        except PermissionError:
+            if attempt < retries:
+                logger.warning(
+                    "無法寫入 xlsx（檔案可能被 Excel 開啟），%d 秒後重試（%d/%d）…請關閉 Excel 後等待",
+                    delay, attempt, retries,
+                )
+                time.sleep(delay)
+            else:
+                logger.error(
+                    "重試 %d 次後仍無法寫入 xlsx，請手動在 %s Row%d F 欄填入 Y",
+                    retries, sheet_name, row_idx,
+                )
+                raise
 
 
 # ──────────────────────────────────────────────
@@ -118,6 +144,28 @@ def build_output_path(sheet_name: str, seq: int) -> Path:
     return date_dir / f"{sheet_name}_{seq:02d}_{date_str}.mp4"
 
 
+def write_mp4_metadata(video_path: Path, title: str, notes: str):
+    """
+    將標題（D欄）和註記（E欄）直接寫入 MP4 檔案的 metadata，
+    對應 Windows「詳細資料」中的「標題」(©nam) 和「註解」(©cmt) 欄位。
+    兩者皆空則不動作。
+    """
+    if not title and not notes:
+        return
+    try:
+        tags = MP4(str(video_path))
+        if title:
+            tags["\xa9nam"] = [title]
+        if notes:
+            tags["\xa9cmt"] = [notes]
+        tags.save()
+        logging.getLogger(__name__).info(
+            "已寫入 MP4 metadata — 標題：%s  註解：%s", title or "(空)", notes or "(空)"
+        )
+    except Exception as e:
+        logging.getLogger(__name__).warning("寫入 MP4 metadata 失敗：%s", e)
+
+
 # ──────────────────────────────────────────────
 # 主流程
 # ──────────────────────────────────────────────
@@ -131,6 +179,7 @@ async def run():
     password     = os.getenv("X_PASSWORD", "").strip()
     handle       = os.getenv("X_HANDLE", "").strip()
     login_method = os.getenv("LOGIN_METHOD", "x").strip().lower()
+    cdp_url      = os.getenv("CDP_URL", "").strip()  # e.g. http://localhost:9222
 
     if not username or not password:
         logger.error("請在 .env 中設定 X_USERNAME 與 X_PASSWORD")
@@ -171,7 +220,7 @@ async def run():
         handle=handle,
         login_method=login_method,
     )
-    await bot.start(headless=False)
+    await bot.start(headless=False, cdp_url=cdp_url)
 
     error_occurred = False
     success_count  = 0
@@ -191,6 +240,8 @@ async def run():
             prompts    = row["prompts"]   # [(seq, text), ...]
 
             row_all_ok = True
+            title = row.get("title", "")
+            notes = row.get("notes", "")
 
             for seq, prompt_text in prompts:
                 global_idx += 1
@@ -202,6 +253,10 @@ async def run():
                     global_idx, total_prompts, sheet_name, row_idx, seq,
                 )
                 logger.info("Prompt：%s", prompt_text[:120])
+                if title:
+                    logger.info("主題：%s", title)
+                if notes:
+                    logger.info("註記：%s", notes)
 
                 ok = await bot.generate_and_download(
                     prompt=prompt_text,
@@ -210,6 +265,7 @@ async def run():
 
                 if ok:
                     logger.info("成功：影片已儲存至 %s", output_path)
+                    write_mp4_metadata(output_path, title, notes)
                     success_count += 1
                 else:
                     logger.error(
